@@ -133,8 +133,8 @@ def get_iterator(args, mode):
 def main():
     parser = get_parser()
     args = parser.parse_args()
-
-    mode = ["dev", "test", "train"]
+    # removed dev and train modes
+    mode = ["test"]
     for m in mode:
         ds_name = osp.split(args.anno_root)[-1]
         fname = f'mae_feat_{ds_name}'
