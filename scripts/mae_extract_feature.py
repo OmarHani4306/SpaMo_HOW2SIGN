@@ -3,163 +3,172 @@ import numpy as np
 import torch
 import argparse
 import tqdm
-import os.path as osp
 from PIL import Image
+from torch.utils.data import Dataset, DataLoader
 from transformers import VideoMAEModel, VideoMAEImageProcessor
-
+import os.path as osp
 import sys
-# Get the absolute path to the parent directory
+
+# --- PATH FIX ---------------------------------------------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-print(f"Added to path: {parent_dir}")  # Debug line
-
 from utils.helpers import sliding_window_for_list, read_video, get_img_list
 
+# --- GLOBAL SETTINGS --------------------------------------------------------
 _GLOBAL_SEED = 0
 np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 
+# ----------------------------------------------------------------------------
 class VideoMAEFeatureReader(object):
-    def __init__(
-        self, 
-        model_name='MCG-NJU/videomae-large', 
-        cache_dir=None,
-        device='cuda:0',
-        overlap_size=0,
-        nth_layer=-1
-    ):
+    """Holds model + GPU inference."""
+    def __init__(self, model_name, device, overlap_size, nth_layer, cache_dir=None):
         self.device = device
         self.overlap_size = overlap_size
         self.nth_layer = nth_layer
 
-        self.image_processor = VideoMAEImageProcessor.from_pretrained(model_name, cache_dir=cache_dir)
+        self.image_processor = VideoMAEImageProcessor.from_pretrained(
+            model_name, cache_dir=cache_dir
+        )
         self.model = VideoMAEModel.from_pretrained(model_name).to(self.device).eval()
-        
+
     @torch.no_grad()
-    def get_feats(self, video):
-        inputs = self.image_processor(images=video, return_tensors="pt").to(self.device)
-        
+    def get_feats(self, video_batch):
+        inputs = self.image_processor(images=video_batch, return_tensors="pt")
+        inputs = {k: v.to(self.device, non_blocking=True) for k, v in inputs.items()}
+
         outputs = self.model(**inputs, output_hidden_states=True).hidden_states
-        
-        outputs = outputs[self.nth_layer]
-        outputs = outputs[:, 0]
-        
-        return outputs
+        feats = outputs[self.nth_layer][:, 0]     # CLS token
+        return feats
 
 
+# ----------------------------------------------------------------------------
+class VideoDataset(Dataset):
+    """CPU side: load frames, crop them into windows."""
+    def __init__(self, args, mode):
+        self.args = args
+        self.mode = mode
+
+        self.data = np.load(
+            osp.join(args.anno_root, f"{mode}_info.npy"),
+            allow_pickle=True
+        ).item()
+
+        self.num_videos = len(self.data)
+        self.ds_name = osp.split(args.anno_root)[-1]
+
+    def __len__(self):
+        return self.num_videos
+
+    def __getitem__(self, idx):
+        entry = self.data[idx]
+        fname, fileid = entry["folder"], entry["fileid"]
+        st = None
+
+        if self.ds_name in ["Phoenix14T", "CSL-Daily"]:
+            image_list = get_img_list(self.ds_name, self.args.video_root, fname)
+            image_list = image_list + [image_list[-1]] * max(0, 16 - len(image_list))
+            clips = sliding_window_for_list(image_list, 16, self.args.overlap_size)
+
+            videos = []
+            for clip in clips:
+                pil_frames = []
+                for path in clip:
+                    img = Image.open(path).convert("RGB")
+                    pil_frames.append(img.copy())
+                    img.close()
+                videos.append(pil_frames)
+
+        elif self.ds_name == "How2Sign":
+            st = str(entry["original_info"]["START_REALIGNED"])
+            end = entry["original_info"]["END_REALIGNED"]
+            frames = read_video(fname, start_time=st, end_time=end)
+            if len(frames) == 0:
+                return ([], fileid, st)
+
+            frames = frames + [frames[-1]] * max(0, 16 - len(frames))
+            videos = sliding_window_for_list(frames, 16, self.args.overlap_size)
+
+        else:
+            raise NotImplementedError
+
+        return videos, fileid, st
+
+
+# ----------------------------------------------------------------------------
 def get_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--anno_root', help='location of tsv files', required=True)
-    parser.add_argument('--video_root', help='location of tsv files', required=True)
-    parser.add_argument('--save_dir', help='where to save the output', required=True)
-    parser.add_argument('--model_name', help='ViT model name', default='MCG-NJU/videomae-large')
+    parser.add_argument('--anno_root', required=True)
+    parser.add_argument('--video_root', required=True)
+    parser.add_argument('--save_dir', required=True)
+    parser.add_argument('--model_name', default='MCG-NJU/videomae-large')
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--device', help='device to use', default='cpu')
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--overlap_size', type=int, default=8)
     parser.add_argument('--mode', nargs='+', type=str)
     parser.add_argument('--nth_layer', type=int, default=-1)
-    parser.add_argument('--cache_dir', help='cache dir for model', default=None)
+    parser.add_argument('--cache_dir', default=None)
+    parser.add_argument('--num_workers', type=int, default=4)
     return parser
 
 
-def get_iterator(args, mode):
-    batch_size = args.batch_size
-
-    data = np.load(os.path.join(args.anno_root, f'{mode}_info.npy'), allow_pickle=True).item()
-    num = len(data) - 1
-    ds_name = osp.split(args.anno_root)[-1]
+# ----------------------------------------------------------------------------
+def main():
+    args = get_parser().parse_args()
 
     reader = VideoMAEFeatureReader(
-        args.model_name, 
-        device=args.device, 
-        overlap_size=args.overlap_size, 
-        nth_layer=args.nth_layer,
-        cache_dir=args.cache_dir
+        args.model_name,
+        args.device,
+        args.overlap_size,
+        args.nth_layer,
+        args.cache_dir
     )
-    
-    def iterate():
-        for i in range(num):
-            fname = data[i]['folder']
-            
-            if ds_name == 'Phoenix14T' or ds_name == 'CSL-Daily':
-                image_list = get_img_list(ds_name, args.video_root, fname)
-                
-                if len(image_list) < 16:
-                    len_diff = 16 - len(image_list)
-                    image_list.extend([image_list[-1]] * (16 - len(image_list)))
-                image_list_chunks = sliding_window_for_list(image_list, window_size=16, overlap_size=args.overlap_size)
-                
-                videos = []
-                for image_list in image_list_chunks:
-                    videos.append([Image.open(image).convert('RGB') for image in image_list])
-                
-                video_feats = []
-                for j in range(0, len(videos), batch_size):
-                    video_batch = videos[j:min(j + batch_size, len(videos))]
-                    feats = reader.get_feats(video_batch).cpu().numpy()
-                    video_feats.append(feats)
-                    
-                yield np.concatenate(video_feats, axis=0), data[i]['fileid'], None
-            
-            else:
-                if ds_name == 'How2Sign':
-                    start_time, end_time = data[i]['original_info']['START_REALIGNED'], data[i]['original_info']['END_REALIGNED']
-                    videos = read_video(fname, start_time=start_time, end_time=end_time)
-                    
-                    if len(videos) > 0:
-                        if len(videos) < 16:
-                            len_diff = 16 - len(videos)
-                            videos.extend([videos[-1]] * (16 - len(videos)))
-                        
-                        videos = sliding_window_for_list(videos, window_size=16, overlap_size=args.overlap_size)
-                        
-                        video_feats = []
-                        for j in range(0, len(videos), batch_size):
-                            video_batch = videos[j:min(j + batch_size, len(videos))]
-                            feats = reader.get_feats(video_batch).cpu().numpy()
-                            video_feats.append(feats)
-                        
-                        yield np.concatenate(video_feats, axis=0), data[i]['fileid'], str(start_time)
-                    
-                    else:
-                        yield [], data[i]['fileid'], str(start_time)
-    
-    return iterate, num
 
-def main():
-    parser = get_parser()
-    args = parser.parse_args()
-    # removed dev and train modes
-    mode = ["test"]
+    mode = ["test"]  # requested
     for m in mode:
         ds_name = osp.split(args.anno_root)[-1]
-        fname = f'mae_feat_{ds_name}'
-        os.makedirs(osp.join(args.save_dir, fname, m), exist_ok=True)
-    
-        if ds_name == 'How2Sign':
-            if m == 'dev': _m = 'val'
-            else: _m = m
-        elif ds_name == 'NIASL2021':
-            if m == 'dev': _m = 'validation' 
-        else:
-            _m = m
+        out_folder = f"mae_feat_{ds_name}"
+        os.makedirs(osp.join(args.save_dir, out_folder, m), exist_ok=True)
 
-        generator, num = get_iterator(args, _m)
-        iterator = generator()
+        # Adjust internal mode name for datasets (How2Sign etc.)
+        if ds_name == "How2Sign":   _m = "val" if m == "dev" else m
+        elif ds_name == "NIASL2021": _m = "validation" if m == "dev" else m
+        else:                        _m = m
 
-        for vit_feat in tqdm.tqdm(iterator, total=num):
-            feats, id, st = vit_feat
-            save_path = osp.join(args.save_dir, fname, m)
-            postfix = f'_overlap-{args.overlap_size}'
-            
-            if st is not None:
-                postfix = f'_{st}{postfix}'
-            
-            np.save(osp.join(save_path, f'{id}{postfix}.npy'), feats)
+        dataset = VideoDataset(args, _m)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+        print(f"Extracting '{_m}' using {args.num_workers} workers...")
+
+        for batch in tqdm.tqdm(dataloader, total=len(dataset)):
+            videos, fileid, st = batch[0]
+            if not videos:
+                continue
+
+            feats_per_video = []
+            for j in range(0, len(videos), args.batch_size):
+                chunk = videos[j : j + args.batch_size]
+                feats = reader.get_feats(chunk).cpu().numpy()
+                feats_per_video.append(feats)
+
+            feats = np.concatenate(feats_per_video, axis=0)
+
+            save_path = osp.join(args.save_dir, out_folder, _m)
+            postfix = (f"_{st}" if st is not None else "") + f"_overlap-{args.overlap_size}"
+            np.save(osp.join(save_path, f"{fileid}{postfix}.npy"), feats)
+
+        print(f"✅ Extraction for '{_m}' complete.")
 
 
 if __name__ == "__main__":
