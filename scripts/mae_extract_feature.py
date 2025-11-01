@@ -120,7 +120,8 @@ class VideoDataset(Dataset):
 
             frames = frames + [frames[-1]] * max(0, 16 - len(frames))
             videos = sliding_window_for_list(frames, 16, self.args.overlap_size)
-
+            #  Convert PIL images → tensors
+            videos = [[self.transform(f) for f in clip] for clip in videos]
         else:
             raise NotImplementedError
 
