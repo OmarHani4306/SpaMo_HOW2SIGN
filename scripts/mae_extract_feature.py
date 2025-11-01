@@ -67,28 +67,56 @@ class VideoDataset(Dataset):
     def __getitem__(self, idx):
         entry = self.data[idx]
         fname, fileid = entry["folder"], entry["fileid"]
-        st = None
+        st_return_str = None # This will be the string for the filename
+        videos = []
 
-        if self.ds_name in ["Phoenix14T", "CSL-Daily"]:
+        if self.ds_name in ["Phoenix1T", "CSL-Daily"]:
             image_list = get_img_list(self.ds_name, self.args.video_root, fname)
             image_list = image_list + [image_list[-1]] * max(0, 16 - len(image_list))
             clips = sliding_window_for_list(image_list, 16, self.args.overlap_size)
 
-            videos = []
             for clip in clips:
                 pil_frames = []
                 for path in clip:
-                    img = Image.open(path).convert("RGB")
-                    pil_frames.append(img.copy())
-                    img.close()
-                videos.append(pil_frames)
+                    try:
+                        img = Image.open(path).convert("RGB")
+                        pil_frames.append(img.copy())
+                        img.close()
+                    except Exception as e:
+                        print(f"Warning: Failed to load image {path}: {e}")
+                        continue # Skip corrupted images
+                if pil_frames:
+                    videos.append(pil_frames)
 
         elif self.ds_name == "How2Sign":
-            st = str(entry["original_info"]["START_REALIGNED"])
-            end = entry["original_info"]["END_REALIGNED"]
-            frames = read_video(fname, start_time=st, end_time=end)
-            if len(frames) == 0:
-                return ([], fileid, st)
+            # --- START OF FIX ---
+            
+            # 1. Get the raw start/end time values
+            start_time_val = entry["original_info"]["START_REALIGNED"]
+            end_time_val = entry["original_info"]["END_REALIGNED"]
+
+            # 2. Convert them to float, handling None, NaN, or empty strings
+            try:
+                start_time_float = float(start_time_val)
+            except (ValueError, TypeError):
+                start_time_float = None # Pass None if conversion fails
+
+            try:
+                end_time_float = float(end_time_val)
+            except (ValueError, TypeError):
+                end_time_float = None
+
+            # 3. Pass the FLOATS (or Nones) to read_video
+            frames = read_video(fname, start_time=start_time_float, end_time=end_time_float)
+            
+            # 4. Create the string version for the return value *after* reading
+            st_return_str = str(start_time_float) if start_time_float is not None else "None"
+            
+            # --- END OF FIX ---
+
+            if not frames:
+                return ([], fileid, st_return_str)
+
 
             frames = frames + [frames[-1]] * max(0, 16 - len(frames))
             videos = sliding_window_for_list(frames, 16, self.args.overlap_size)
@@ -96,7 +124,7 @@ class VideoDataset(Dataset):
         else:
             raise NotImplementedError
 
-        return videos, fileid, st
+        return videos, fileid, st_return_str
 
 
 # ----------------------------------------------------------------------------
