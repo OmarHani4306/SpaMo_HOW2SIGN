@@ -214,7 +214,7 @@ def main():
         # 3. Create the "Waiter Team Manager" (DataLoader)
         dataloader = DataLoader(
             dataset,
-            batch_size=args.batch_size,           # DataLoader batch size passed as an argument
+            batch_size=1,           # must be 1
             shuffle=False,
             collate_fn=custom_collate_fn, # Use our custom collate
             num_workers=args.num_workers, # Parallel CPU workers
