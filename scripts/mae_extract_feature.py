@@ -55,7 +55,9 @@ class VideoMAEFeatureReader(object):
         inputs = inputs.to(self.device, non_blocking=True)
 
         # 3. Run the model
-        outputs = self.model(**inputs, output_hidden_states=True).hidden_states
+        # AMP enabled
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            outputs = self.model(**inputs, output_hidden_states=True).hidden_states
         
         # 4. Get the last hidden state's [CLS] token
         feats = outputs[self.nth_layer][:, 0]
