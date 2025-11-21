@@ -212,14 +212,14 @@ def main():
         # 3. Create the "Waiter Team Manager" (DataLoader)
         dataloader = DataLoader(
             dataset,
-            batch_size=1,           # DataLoader batch size is 1 (one video at a time)
+            batch_size=args.batch_size,           # DataLoader batch size passed as an argument
             shuffle=False,
             collate_fn=custom_collate_fn, # Use our custom collate
             num_workers=args.num_workers, # Parallel CPU workers
             pin_memory=True,              # Fast CPU-to-GPU transfer
             persistent_workers=True   # Keep workers alive
         )
-
+     
         print(f"Extracting '{_m}' using {args.num_workers} workers... Saving to {save_dir_split}")
 
         # 4. Run the main loop
