@@ -86,9 +86,7 @@ class VideoDataset(Dataset):
 
         print(f"[VideoDataset] '{mode}' initialized with {self.num_videos} videos.")
 
-        # --------------------------------------------------------
-        # Preprocessing: resize to 256 → center crop to 224
-        # --------------------------------------------------------
+        # Preprocessing sizes
         self.resize_size = 256
         self.crop_size = 224
 
@@ -99,10 +97,10 @@ class VideoDataset(Dataset):
     # Helper: Resize + Center Crop
     # ------------------------------------------------------------
     def process_frame(self, img):
-        # Resize to 256×256 (fast bilinear)
+        # Resize to 256×256
         img = img.resize(
             (self.resize_size, self.resize_size),
-            resample=Image.BILINEAR  # Safe for all Pillow versions
+            resample=Image.BILINEAR
         )
 
         # Center crop to 224×224
@@ -118,25 +116,19 @@ class VideoDataset(Dataset):
     # Main loader
     # ------------------------------------------------------------
     def __getitem__(self, idx):
-        """
-        Returns:
-            videos: list of clips (each clip = list of 16 processed PIL images)
-            fileid: ID for saving the features
-            start_time_str: ONLY for How2Sign (None or number)
-        """
         entry = self.data[idx]
         fname, fileid = entry["folder"], entry["fileid"]
         start_time_str = None
         videos = []
 
         # ============================================================
-        # CASE 1: Phoenix14T / CSL-Daily (image lists)
+        # CASE 1: Phoenix14T / CSL-Daily
         # ============================================================
         if self.ds_name in ["Phoenix14T", "CSL-Daily"]:
 
             image_list = get_img_list(self.ds_name, self.args.video_root, fname)
 
-            # Pad to at least 16 frames
+            # Pad to minimum 16
             if len(image_list) < 16:
                 image_list += [image_list[-1]] * (16 - len(image_list))
 
@@ -147,7 +139,7 @@ class VideoDataset(Dataset):
                 for path in clip:
                     try:
                         img = Image.open(path).convert("RGB")
-                        img = self.process_frame(img)  # <---- APPLY RESIZE+ CROP
+                        img = self.process_frame(img)
                         pil_frames.append(img.copy())
                         img.close()
                     except Exception as e:
@@ -158,51 +150,60 @@ class VideoDataset(Dataset):
                     videos.append(pil_frames)
 
         # ============================================================
-        # CASE 2: How2Sign (video with aligned timestamps)
+        # CASE 2: How2Sign
         # ============================================================
         elif self.ds_name == "How2Sign":
 
             # Get aligned timestamps
-            start_val = entry["original_info"]["START_REALIGNED"]
-            end_val   = entry["original_info"]["END_REALIGNED"]
+            s_val = entry["original_info"]["START_REALIGNED"]
+            e_val = entry["original_info"]["END_REALIGNED"]
 
-            # Safe float conversion
+            # Convert safely
             try:
-                start_f = float(start_val)
+                s = float(s_val)
             except (ValueError, TypeError):
-                start_f = None
+                s = None
 
             try:
-                end_f = float(end_val)
+                e = float(e_val)
             except (ValueError, TypeError):
-                end_f = None
+                e = None
 
-            # Read video segment
-            frames = read_video(fname, start_time=start_f, end_time=end_f)
+            # For returning
+            start_time_str = str(s) if s is not None else "None"
 
-            start_time_str = str(start_f) if start_f is not None else "None"
+            # Read video frames
+            frames = read_video(fname, start_time=s, end_time=e)
 
             if len(frames) == 0:
                 return [], fileid, start_time_str
 
-            # Pad if fewer than 16 frames
+            # Pad to 16
             if len(frames) < 16:
                 frames += [frames[-1]] * (16 - len(frames))
 
-            # Convert frames → PIL → resize+crop
-            processed_frames = []
+            # Convert → always PIL → resize+crop
+            processed = []
             for f in frames:
-                img = Image.fromarray(f).convert("RGB")
-                img = self.process_frame(img)          # <---- APPLY RESIZE+ CROP
-                processed_frames.append(img)
 
-            # Now slide over the processed frames
-            videos = sliding_window_for_list(processed_frames, 16, self.args.overlap_size)
+                # Fix: handle BOTH PIL and NumPy frames safely
+                if isinstance(f, np.ndarray):
+                    img = Image.fromarray(f).convert("RGB")
+                elif isinstance(f, Image.Image):
+                    img = f.convert("RGB")
+                else:
+                    raise TypeError(f"Unexpected frame type: {type(f)}")
+
+                img = self.process_frame(img)
+                processed.append(img)
+
+            videos = sliding_window_for_list(processed, 16, self.args.overlap_size)
 
         else:
             raise NotImplementedError(f"Unknown dataset: {self.ds_name}")
 
         return videos, fileid, start_time_str
+
 
 
 # ----------------------------------------------------------------------------
